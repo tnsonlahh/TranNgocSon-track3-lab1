@@ -1,38 +1,69 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Literal
-from .mock_runtime import FAILURE_MODE_BY_QID, actor_answer, evaluator, reflector
-from .schemas import AttemptTrace, QAExample, ReflectionEntry, RunRecord
+from dataclasses import dataclass, field
+from typing import Literal, Protocol
+from .mock_runtime import FAILURE_MODE_BY_QID, MockRuntime
+from .schemas import AttemptTrace, JudgeResult, QAExample, ReflectionEntry, RunRecord
+
+
+class AgentRuntime(Protocol):
+    def actor_answer(
+        self,
+        example: QAExample,
+        attempt_id: int,
+        agent_type: Literal["react", "reflexion"],
+        reflection_memory: list[str],
+    ) -> tuple[str, int, int]: ...
+
+    def evaluator(self, example: QAExample, answer: str) -> tuple[JudgeResult, int, int]: ...
+
+    def reflector(self, example: QAExample, attempt_id: int, judge: JudgeResult) -> tuple[ReflectionEntry, int, int]: ...
 
 @dataclass
 class BaseAgent:
     agent_type: Literal["react", "reflexion"]
     max_attempts: int = 1
+    runtime: AgentRuntime = field(default_factory=MockRuntime)
+
+    def _adaptive_max_attempts(self, example: QAExample) -> int:
+        if self.agent_type != "reflexion":
+            return self.max_attempts
+        if example.difficulty == "hard":
+            return max(self.max_attempts, 4)
+        return self.max_attempts
+
+    def _compress_reflection_memory(self, reflection_memory: list[str], keep_last: int = 2) -> list[str]:
+        if len(reflection_memory) <= keep_last:
+            return reflection_memory
+        return reflection_memory[-keep_last:]
+
     def run(self, example: QAExample) -> RunRecord:
         reflection_memory: list[str] = []
         reflections: list[ReflectionEntry] = []
         traces: list[AttemptTrace] = []
         final_answer = ""
         final_score = 0
-        for attempt_id in range(1, self.max_attempts + 1):
-            answer = actor_answer(example, attempt_id, self.agent_type, reflection_memory)
-            judge = evaluator(example, answer)
-            # TODO: Replace with actual token count from LLM response
-            token_estimate = 320 + (attempt_id * 65) + (120 if self.agent_type == "reflexion" else 0)
-            # TODO: Replace with actual latency measurement
-            latency_ms = 160 + (attempt_id * 40) + (90 if self.agent_type == "reflexion" else 0)
+        effective_max_attempts = self._adaptive_max_attempts(example)
+        for attempt_id in range(1, effective_max_attempts + 1):
+            answer, actor_tokens, actor_latency = self.runtime.actor_answer(example, attempt_id, self.agent_type, reflection_memory)
+            judge, eval_tokens, eval_latency = self.runtime.evaluator(example, answer)
+            token_estimate = actor_tokens + eval_tokens
+            latency_ms = actor_latency + eval_latency
             trace = AttemptTrace(attempt_id=attempt_id, answer=answer, score=judge.score, reason=judge.reason, token_estimate=token_estimate, latency_ms=latency_ms)
             final_answer = answer
             final_score = judge.score
             if judge.score == 1:
                 traces.append(trace)
                 break
-            
-            # TODO: Học viên triển khai logic Reflexion tại đây
-            # 1. Kiểm tra nếu agent_type là 'reflexion' và chưa hết số lần attempt
-            # 2. Gọi hàm reflector để lấy nội dung reflection
-            # 3. Cập nhật reflection_memory để Actor dùng cho lần sau
-            pass
+
+            if self.agent_type == "reflexion" and attempt_id < effective_max_attempts:
+                reflection, reflection_tokens, reflection_latency = self.runtime.reflector(example, attempt_id, judge)
+                reflections.append(reflection)
+                reflection_memory.append(reflection.next_strategy)
+                reflection_memory = self._compress_reflection_memory(reflection_memory)
+                trace.reflection = reflection
+                trace.token_estimate += reflection_tokens
+                trace.latency_ms += reflection_latency
+
             traces.append(trace)
         total_tokens = sum(t.token_estimate for t in traces)
         total_latency = sum(t.latency_ms for t in traces)
@@ -40,9 +71,9 @@ class BaseAgent:
         return RunRecord(qid=example.qid, question=example.question, gold_answer=example.gold_answer, agent_type=self.agent_type, predicted_answer=final_answer, is_correct=bool(final_score), attempts=len(traces), token_estimate=total_tokens, latency_ms=total_latency, failure_mode=failure_mode, reflections=reflections, traces=traces)
 
 class ReActAgent(BaseAgent):
-    def __init__(self) -> None:
-        super().__init__(agent_type="react", max_attempts=1)
+    def __init__(self, runtime: AgentRuntime | None = None) -> None:
+        super().__init__(agent_type="react", max_attempts=1, runtime=runtime or MockRuntime())
 
 class ReflexionAgent(BaseAgent):
-    def __init__(self, max_attempts: int = 3) -> None:
-        super().__init__(agent_type="reflexion", max_attempts=max_attempts)
+    def __init__(self, max_attempts: int = 3, runtime: AgentRuntime | None = None) -> None:
+        super().__init__(agent_type="reflexion", max_attempts=max_attempts, runtime=runtime or MockRuntime())
